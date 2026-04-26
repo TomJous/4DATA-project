@@ -1,5 +1,6 @@
 
-MOVIES_TEMPLATE_FILE_PATH = "data/raw/movies_{}.json"
+MOVIES_TEMPLATE_FILE_PATH = "data/raw/movies_{}_{}.json"
+DUCKDB_DATABASE_PATH = "data/staging/data.duckdb"
 
 
 
