@@ -1,1 +1,11 @@
 .env
+
+resources/__pycache__
+__pycache__
+assets/__pycache__
+sensors/__pycache__
+schedules/__pycache__
+partitions/__pycache__
+jobs/__pycache__
+
+data/staging/movies_*
