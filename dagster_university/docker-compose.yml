@@ -1,0 +1,9 @@
+services:
+  dagster:
+    build: .
+    container_name: dagster_data
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - .:/app
