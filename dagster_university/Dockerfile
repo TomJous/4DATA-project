@@ -5,7 +5,7 @@ WORKDIR /app
 COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt &&\
-    pip install --disable-pip-version-check --no-cache-dir install -e .[dev]
+    pip install --disable-pip-version-check --no-cache-dir -e .[dev]
 
 EXPOSE 3000
 

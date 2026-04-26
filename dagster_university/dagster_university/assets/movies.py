@@ -17,7 +17,6 @@ api_token = os.getenv("API_TOKEN")
 
 # gérer le docker 
 
-
 @asset
 def get_movie_file_from_api(config: MovieConfig):
 
@@ -86,7 +85,7 @@ def load_movie_into_db(config: MovieConfig, database: DuckDBResource) -> None:
         conn.execute(query)
 
 @asset(
-    deps = [load_movie_into_db]
+    deps = ["load_movie_into_db"]
 )
 def add_movie_revenues(database: DuckDBResource)-> None:
     with database.get_connection() as conn:
