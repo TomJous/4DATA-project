@@ -3,11 +3,13 @@ import os
 import time
 from . import constants
 from dotenv import load_dotenv
-from dagster import asset, Config
+from dagster import asset, Config,AssetExecutionContext
 import json
+from datetime import datetime
 
 from dagster_duckdb import DuckDBResource
 from .requests import MovieConfig
+from ..partitions import monthly_partition
 
 
 load_dotenv() 
@@ -15,10 +17,15 @@ api_token = os.getenv("API_TOKEN")
 
 # faire en sorte de réupérer qu'un partitionnement des donnés 
 
-# gérer le docker 
+@asset(
+    partitions_def=monthly_partition
+)
+def get_movie_file_from_api(context:AssetExecutionContext):
 
-@asset
-def get_movie_file_from_api(config: MovieConfig):
+    partition_date = context.partition_key
+
+    start_date=partition_date[0]
+    end_date=partition_date[-1]
 
     all_movies = []
     current_page = 1
@@ -32,8 +39,8 @@ def get_movie_file_from_api(config: MovieConfig):
     while current_page <= total_pages:
 
         body = {
-            "release_date.gte" : config.start_date,
-            "release_date.lte" : config.end_date,
+            "release_date.gte" : start_date,
+            "release_date.lte" : end_date,
             "page" : f"{current_page}"
         }
 
@@ -48,20 +55,61 @@ def get_movie_file_from_api(config: MovieConfig):
             print(f"Erreur à la page {current_page}: {raw_movies.text}")
             break
 
-    file_path = constants.MOVIES_TEMPLATE_FILE_PATH.format(config.start_date, config.end_date)
+    file_path = constants.MOVIES_TEMPLATE_FILE_PATH.format(start_date, end_date)
     with open(file_path, "w") as output_file:
         json.dump(all_movies, output_file, ensure_ascii=False) #pour les films étrangés
 
+    context.log.info(f"{len(all_movies)} films récupérés pour {start_date} -> {end_date}")
+
+
+@asset
+def get_genres_from_api(database: DuckDBResource) -> None:
+    
+    url = "https://api.themoviedb.org/3/genre/movie/list"
+
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {api_token}"
+    }
+
+
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+
+    genres = response.json().get("genres", [])
+
+    query="""
+        CREATE TABLE IF NOT EXISTS genres(
+            genre_id INTEGER,
+            genre_name VARCHAR
+        );
+    """
+
+    with database.get_connection() as conn:
+        conn.execute(query)
+
+        conn.executemany("""
+            INSERT INTO genres VALUES(?,?);
+        """,
+        [(genre["id"],genre["name"]) for genre in genres]
+        )
+
 @asset(
-deps=["get_movie_file_from_api"]
+deps=["get_movie_file_from_api"],
+partitions_def = monthly_partition
 )
-def load_movie_into_db(config: MovieConfig, database: DuckDBResource) -> None:
+def load_movie_into_db(context:AssetExecutionContext, database: DuckDBResource) -> None:
+
+    partition_date = context.partition_key
+
+    start_date=partition_date[0]
+    end_date=partition_date[-1]
 
     #par défault la requête pour découvrire les films de nous transmet pas les revenues générés
-    file_path = constants.MOVIES_TEMPLATE_FILE_PATH.format(config.start_date, config.end_date)
+    file_path = constants.MOVIES_TEMPLATE_FILE_PATH.format(start_date, end_date)
 
     query = f"""
-        CREATE OR REPLACE TABLE movie AS (
+        CREATE TABLE IF NOT EXISTS movie AS (
         SELECT
         id,
         title,
@@ -84,12 +132,15 @@ def load_movie_into_db(config: MovieConfig, database: DuckDBResource) -> None:
     with database.get_connection() as conn:
         conn.execute(query)
 
+    context.log.info(f"Données chargées dans DuckDB pour {start_date} -> {end_date}")
+
+
 @asset(
     deps = ["load_movie_into_db"]
 )
-def add_movie_revenues(database: DuckDBResource)-> None:
+def add_movie_revenues(context:AssetExecutionContext,database: DuckDBResource)-> None:
     with database.get_connection() as conn:
-        query = "ALTER TABLE movie ADD COLUMN revenue BIGINT;"
+        query = "ALTER TABLE movie ADD COLUMN IF NOT EXISTS revenue BIGINT;"
         conn.execute(query)
         query = "SELECT id FROM movie;"
         movies = conn.execute(query).fetchall()
@@ -102,8 +153,10 @@ def add_movie_revenues(database: DuckDBResource)-> None:
 
             if response.status_code == 200:
                 revenue = response.json().get("revenue")
-                inject_revenue = f"UPDATE movie SET revenue = {revenue} WHERE id = {movie[0]};"
-                conn.execute(inject_revenue)
+                inject_revenue = f"UPDATE movie SET revenue = ? WHERE id = ?;"
+                conn.execute(inject_revenue,[revenue,movie[0]])
             else:
                 time.sleep(1)
+
+    context.log.info("Revenus ajoutés avec succès.")
 
