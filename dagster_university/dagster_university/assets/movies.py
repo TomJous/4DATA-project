@@ -158,7 +158,7 @@ def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource)
         original_title,
         original_language,
         overview,
-        TRY_CAST(NULLIF(release_date, '') AS DATE) AS release_date,
+        TRY_CAST(NULLIF(release_date::VARCHAR, '') AS DATE) AS release_date,
         genre_ids,
         popularity,
         vote_average,
