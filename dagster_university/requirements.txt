@@ -1,6 +1,6 @@
 dagster==1.7.*
 dagster-webserver
-duckdb
 pandas
-clendar
-datetime
+psycopg2-binary
+sqlalchemy
+

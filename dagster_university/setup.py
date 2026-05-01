@@ -6,12 +6,13 @@ setup(
     install_requires=[
         "dagster==1.7.*",
         "dagster-cloud",
-        "dagster-duckdb",
         "geopandas",
         "kaleido",
         "pandas",
         "plotly",
+        "psycopg2-binary",
         "shapely",
+        "sqlalchemy",
     ],
     extras_require={"dev": ["dagster-webserver", "pytest"]},
 )

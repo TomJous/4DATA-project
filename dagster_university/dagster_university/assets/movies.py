@@ -7,11 +7,12 @@ import calendar
 
 from dotenv import load_dotenv
 from dagster import asset, AssetExecutionContext
-from dagster_duckdb import DuckDBResource
 import requests
+from sqlalchemy import text
 
 from . import constants
 from ..partitions import monthly_partition
+from ..resources import PostgresResource
 
 
 load_dotenv()
@@ -73,8 +74,8 @@ def get_movie_file_from_api(context: AssetExecutionContext) -> None:
 
 
 @asset
-def get_genres_from_api(database: DuckDBResource) -> None:
-    """Fetch TMDB movie genres and write them into DuckDB."""
+def get_genres_from_api(database: PostgresResource) -> None:
+    """Fetch TMDB movie genres and write them into Postgres."""
     url = "https://api.themoviedb.org/3/genre/movie/list"
     headers = {"accept": "application/json", "Authorization": f"Bearer {api_token}"}
 
@@ -83,26 +84,30 @@ def get_genres_from_api(database: DuckDBResource) -> None:
 
     genres = response.json().get("genres", [])
     query = """
-        CREATE OR REPLACE TABLE genres(
+        DROP TABLE IF EXISTS genres;
+        CREATE TABLE genres(
             genre_id INTEGER,
             genre_name VARCHAR
         );
     """
 
     with database.get_connection() as conn:
-        conn.execute(query)
+        conn.execute(text(query))
         if genres:
-            conn.executemany(
-                "INSERT INTO genres VALUES(?, ?);",
-                [(genre["id"], genre["name"]) for genre in genres],
+            conn.execute(
+                text("INSERT INTO genres VALUES(:genre_id, :genre_name);"),
+                [
+                    {"genre_id": genre["id"], "genre_name": genre["name"]}
+                    for genre in genres
+                ],
             )
 
 @asset(
     deps=["get_movie_file_from_api"],
     partitions_def=monthly_partition
 )
-def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource) -> None:
-    """Load the partition JSON file into the DuckDB movie table without dropping the entire table."""
+def load_movie_into_db(context: AssetExecutionContext, database: PostgresResource) -> None:
+    """Load the partition JSON file into the Postgres movie table."""
     partition_date = context.partition_key
     start_date = partition_date
 
@@ -114,6 +119,28 @@ def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource)
     if not file_path.exists():
         raise FileNotFoundError(f"Movie partition file not found: {file_path}")
 
+    movies = json.loads(file_path.read_text(encoding="utf-8"))
+    rows = [
+        {
+            "id": movie.get("id"),
+            "title": movie.get("title"),
+            "original_title": movie.get("original_title"),
+            "original_language": movie.get("original_language"),
+            "overview": movie.get("overview"),
+            "release_date": movie.get("release_date") or None,
+            "genre_ids": movie.get("genre_ids") or [],
+            "popularity": movie.get("popularity"),
+            "vote_average": movie.get("vote_average"),
+            "vote_count": movie.get("vote_count"),
+            "adult": movie.get("adult"),
+            "backdrop_path": movie.get("backdrop_path"),
+            "poster_path": movie.get("poster_path"),
+            "video": movie.get("video"),
+            "partition_month": start_date,
+        }
+        for movie in movies
+    ]
+
     query_create = """
         CREATE TABLE IF NOT EXISTS movie (
             id INTEGER,
@@ -123,8 +150,8 @@ def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource)
             overview VARCHAR,
             release_date DATE,
             genre_ids INTEGER[],
-            popularity DOUBLE,
-            vote_average DOUBLE,
+            popularity DOUBLE PRECISION,
+            vote_average DOUBLE PRECISION,
             vote_count INTEGER,
             adult BOOLEAN,
             backdrop_path VARCHAR,
@@ -133,51 +160,54 @@ def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource)
             partition_month DATE
         );
     """
-    query_delete = f"DELETE FROM movie WHERE partition_month = DATE '{start_date}';"
-    query_insert = f"""
-    INSERT INTO movie (
-        id,
-        title,
-        original_title,
-        original_language,
-        overview,
-        release_date,
-        genre_ids,
-        popularity,
-        vote_average,
-        vote_count,
-        adult,
-        backdrop_path,
-        poster_path,
-        video,
-        partition_month
-    )
-    SELECT
-        id,
-        title,
-        original_title,
-        original_language,
-        overview,
-        TRY_CAST(NULLIF(release_date, '') AS DATE) AS release_date,
-        genre_ids,
-        popularity,
-        vote_average,
-        vote_count,
-        adult,
-        backdrop_path,
-        poster_path,
-        video,
-        DATE '{start_date}' AS partition_month
-    FROM '{file_path.as_posix()}';
+    query_insert = """
+        INSERT INTO movie (
+            id,
+            title,
+            original_title,
+            original_language,
+            overview,
+            release_date,
+            genre_ids,
+            popularity,
+            vote_average,
+            vote_count,
+            adult,
+            backdrop_path,
+            poster_path,
+            video,
+            partition_month
+        )
+        VALUES (
+            :id,
+            :title,
+            :original_title,
+            :original_language,
+            :overview,
+            :release_date,
+            :genre_ids,
+            :popularity,
+            :vote_average,
+            :vote_count,
+            :adult,
+            :backdrop_path,
+            :poster_path,
+            :video,
+            :partition_month
+        );
     """
 
     with database.get_connection() as conn:
-        conn.execute(query_create)
-        conn.execute(query_delete)
-        conn.execute(query_insert)
+        conn.execute(text(query_create))
+        conn.execute(
+            text("DELETE FROM movie WHERE partition_month = :partition_month;"),
+            {"partition_month": start_date},
+        )
+        if rows:
+            conn.execute(text(query_insert), rows)
 
     context.log.info(
-        "Data loaded into DuckDB for %s -> %s from %s",
+        "Data loaded into Postgres for %s -> %s from %s",
         start_date,
         end_date,
         file_path,
@@ -188,19 +218,19 @@ def load_movie_into_db(context: AssetExecutionContext, database: DuckDBResource)
     partitions_def=monthly_partition,
     deps=["load_movie_into_db"]
 )
-def add_movie_revenues(context: AssetExecutionContext, database: DuckDBResource) -> None:
+def add_movie_revenues(context: AssetExecutionContext, database: PostgresResource) -> None:
     """Enrich movie rows with revenue values from the TMDB movie details endpoint."""
     with requests.Session() as session:
         headers = {"accept": "application/json", "Authorization": f"Bearer {api_token}"}
 
         with database.get_connection() as conn:
-            conn.execute("ALTER TABLE movie ADD COLUMN IF NOT EXISTS revenue BIGINT;")
+            conn.execute(text("ALTER TABLE movie ADD COLUMN IF NOT EXISTS revenue BIGINT;"))
             movie_rows = conn.execute(
-                """
+                text("""
                 SELECT id
                 FROM movie
                 WHERE revenue IS NULL
-                """
+                """)
             ).fetchall()
 
             for (movie_id,) in movie_rows:
@@ -210,8 +240,8 @@ def add_movie_revenues(context: AssetExecutionContext, database: DuckDBResource)
                 if response.status_code == 200:
                     revenue = response.json().get("revenue")
                     conn.execute(
-                        "UPDATE movie SET revenue = ? WHERE id = ?;",
-                        [revenue, movie_id],
+                        text("UPDATE movie SET revenue = :revenue WHERE id = :movie_id;"),
+                        {"revenue": revenue, "movie_id": movie_id},
                     )
                 elif response.status_code == 429:
                     context.log.warning(
@@ -228,4 +258,3 @@ def add_movie_revenues(context: AssetExecutionContext, database: DuckDBResource)
                     time.sleep(1)
 
     context.log.info("Revenues added successfully.")
-
