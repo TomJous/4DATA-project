@@ -1,15 +1,19 @@
 import json
-import os
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
-import duckdb
 import pytest
 from dagster import build_asset_context
-from dagster_duckdb import DuckDBResource
+from sqlalchemy import text
 
-from dagster_university.assets.movies import get_movie_file_from_api, load_movie_into_db, add_movie_revenues
+from dagster_university.assets.movies import (
+    add_movie_revenues,
+    get_movie_file_from_api,
+    load_movie_into_db,
+)
 from dagster_university.assets import constants
+from dagster_university.resources import PostgresResource
 
 
 PARTITION_KEY = "2025-03-01"
@@ -34,17 +38,45 @@ MOCK_MOVIES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Fixtures partagées
+# ---------------------------------------------------------------------------
+
 @pytest.fixture
 def mock_tmdb_response():
     """Simule une réponse paginée de l'API TMDB."""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {
-        "results": MOCK_MOVIES,
-        "total_pages": 1,
-    }
+    mock_resp.json.return_value = {"results": MOCK_MOVIES, "total_pages": 1}
     return mock_resp
 
+
+@pytest.fixture
+def mock_postgres():
+    """Crée un vrai PostgresResource mais avec une connexion mockée."""
+    mock_conn = MagicMock() #faux objet de connexion
+
+    @contextmanager
+    def fake_get_connection(self): 
+        yield mock_conn
+
+    with patch.object(PostgresResource, "get_connection", fake_get_connection): #remplace la lecture de la connexion avec postgres par notre mock
+        resource = PostgresResource(connection_string="postgresql://fake:fake@localhost/fake")
+        yield resource, mock_conn
+
+
+@pytest.fixture
+def movie_json_file(tmp_path, monkeypatch):
+    """Crée un fichier JSON de films pour la partition 2025-03."""
+    monkeypatch.setattr(constants, "MOVIES_TEMPLATE_FILE_PATH", str(tmp_path / "movies_{}_{}.json"))
+    file_path = tmp_path / "movies_2025-03-01_2025-03-31.json"
+    file_path.write_text(json.dumps(MOCK_MOVIES), encoding="utf-8")
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Tests get_movie_file_from_api
+# ---------------------------------------------------------------------------
 
 def test_get_movie_file_from_api_creates_file(mock_tmdb_response, tmp_path, monkeypatch):
     """Vérifie que l'asset crée bien le fichier JSON avec le bon nom."""
@@ -60,8 +92,7 @@ def test_get_movie_file_from_api_creates_file(mock_tmdb_response, tmp_path, monk
         context = build_asset_context(partition_key=PARTITION_KEY)
         get_movie_file_from_api(context)
 
-    expected_file = tmp_path / "movies_2025-03-01_2025-03-31.json"
-    assert expected_file.exists(), "Le fichier JSON n'a pas été créé"
+    assert (tmp_path / "movies_2025-03-01_2025-03-31.json").exists()
 
 
 def test_get_movie_file_from_api_file_content(mock_tmdb_response, tmp_path, monkeypatch):
@@ -78,72 +109,49 @@ def test_get_movie_file_from_api_file_content(mock_tmdb_response, tmp_path, monk
         context = build_asset_context(partition_key=PARTITION_KEY)
         get_movie_file_from_api(context)
 
-    expected_file = tmp_path / "movies_2025-03-01_2025-03-31.json"
-    data = json.loads(expected_file.read_text(encoding="utf-8"))
-
+    data = json.loads((tmp_path / "movies_2025-03-01_2025-03-31.json").read_text())
     assert isinstance(data, list)
     assert len(data) == len(MOCK_MOVIES)
     assert data[0]["id"] == MOCK_MOVIES[0]["id"]
     assert data[0]["title"] == MOCK_MOVIES[0]["title"]
 
 
-@pytest.fixture
-def movie_json_file(tmp_path):
-    """Crée un fichier JSON de films pour la partition 2025-03."""
-    file_path = tmp_path / "movies_2025-03-01_2025-03-31.json"
-    file_path.write_text(json.dumps(MOCK_MOVIES), encoding="utf-8")
-    return tmp_path
+# ---------------------------------------------------------------------------
+# Tests load_movie_into_db
+# ---------------------------------------------------------------------------
 
+def test_load_movie_into_db_executes_create_and_insert(movie_json_file, mock_postgres):
+    """Vérifie que CREATE TABLE et INSERT sont bien exécutés."""
+    resource, mock_conn = mock_postgres
 
-def test_load_movie_into_db_creates_table(movie_json_file, monkeypatch):
-    """Vérifie que la table movie est créée dans DuckDB avec les bonnes lignes."""
-    db_path = str(movie_json_file / "test.duckdb")
-    monkeypatch.setattr(constants, "MOVIES_TEMPLATE_FILE_PATH", str(movie_json_file / "movies_{}_{}.json"))
-
-    database = DuckDBResource(database=db_path)
     context = build_asset_context(partition_key=PARTITION_KEY)
-    load_movie_into_db(context, database)
+    load_movie_into_db(context, resource)
 
-    with duckdb.connect(db_path) as conn:
-        rows = conn.execute("SELECT id, title FROM movie").fetchall()
-
-    assert len(rows) == len(MOCK_MOVIES)
-    assert rows[0][0] == MOCK_MOVIES[0]["id"]
-    assert rows[0][1] == MOCK_MOVIES[0]["title"]
+    executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
+    assert any("CREATE TABLE IF NOT EXISTS movie" in q for q in executed_queries)
+    assert any("INSERT INTO movie" in q for q in executed_queries)
 
 
-def test_load_movie_into_db_idempotent(movie_json_file, monkeypatch):
-    """Vérifie qu'exécuter l'asset deux fois ne duplique pas les données."""
-    db_path = str(movie_json_file / "test.duckdb")
-    monkeypatch.setattr(constants, "MOVIES_TEMPLATE_FILE_PATH", str(movie_json_file / "movies_{}_{}.json"))
+def test_load_movie_into_db_deletes_before_insert(movie_json_file, mock_postgres):
+    """Vérifie que DELETE est exécuté avant INSERT pour garantir l'idempotence."""
+    resource, mock_conn = mock_postgres
 
-    database = DuckDBResource(database=db_path)
     context = build_asset_context(partition_key=PARTITION_KEY)
-    load_movie_into_db(context, database)
-    load_movie_into_db(context, database)
+    load_movie_into_db(context, resource)
 
-    with duckdb.connect(db_path) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM movie").fetchone()[0]
-
-    assert count == len(MOCK_MOVIES)
+    executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
+    assert any("DELETE FROM movie" in q for q in executed_queries)
 
 
-@pytest.fixture
-def db_with_movies(tmp_path, monkeypatch):
-    """Crée une DuckDB avec la table movie déjà chargée."""
-    monkeypatch.setattr(constants, "MOVIES_TEMPLATE_FILE_PATH", str(tmp_path / "movies_{}_{}.json"))
-    json_file = tmp_path / "movies_2025-03-01_2025-03-31.json"
-    json_file.write_text(json.dumps(MOCK_MOVIES), encoding="utf-8")
+# ---------------------------------------------------------------------------
+# Tests add_movie_revenues
+# ---------------------------------------------------------------------------
 
-    db_path = str(tmp_path / "test.duckdb")
-    database = DuckDBResource(database=db_path)
-    context = build_asset_context(partition_key=PARTITION_KEY)
-    load_movie_into_db(context, database)
-    return db_path
+def test_add_movie_revenues_calls_update(mock_postgres):
+    """Vérifie que UPDATE est appelé avec le bon revenue pour chaque film."""
+    resource, mock_conn = mock_postgres
+    mock_conn.execute.return_value.fetchall.return_value = [(1,)]
 
-
-def test_add_movie_revenues_fills_column(db_with_movies):
-    """Vérifie que la colonne revenue est remplie après l'asset."""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {"revenue": 1000000}
@@ -155,18 +163,18 @@ def test_add_movie_revenues_fills_column(db_with_movies):
         mock_session.get.return_value = mock_resp
         mock_session_cls.return_value = mock_session
 
-        database = DuckDBResource(database=db_with_movies)
         context = build_asset_context(partition_key=PARTITION_KEY)
-        add_movie_revenues(context, database)
+        add_movie_revenues(context, resource)
 
-    with duckdb.connect(db_with_movies) as conn:
-        rows = conn.execute("SELECT revenue FROM movie").fetchall()
-
-    assert all(row[0] == 1000000 for row in rows)
+    executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
+    assert any("UPDATE movie SET revenue" in q for q in executed_queries)
 
 
-def test_add_movie_revenues_skips_on_error(db_with_movies):
-    """Vérifie que l'asset ne plante pas si l'API retourne une erreur."""
+def test_add_movie_revenues_skips_on_error(mock_postgres):
+    """Vérifie que l'asset ne plante pas si l'API retourne une erreur 404."""
+    resource, mock_conn = mock_postgres
+    mock_conn.execute.return_value.fetchall.return_value = [(1,)]
+
     mock_resp = MagicMock()
     mock_resp.status_code = 404
 
@@ -177,11 +185,8 @@ def test_add_movie_revenues_skips_on_error(db_with_movies):
         mock_session.get.return_value = mock_resp
         mock_session_cls.return_value = mock_session
 
-        database = DuckDBResource(database=db_with_movies)
         context = build_asset_context(partition_key=PARTITION_KEY)
-        add_movie_revenues(context, database)
+        add_movie_revenues(context, resource)
 
-    with duckdb.connect(db_with_movies) as conn:
-        rows = conn.execute("SELECT revenue FROM movie").fetchall()
-
-    assert all(row[0] is None for row in rows)
+    executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
+    assert not any("UPDATE movie SET revenue" in q for q in executed_queries)

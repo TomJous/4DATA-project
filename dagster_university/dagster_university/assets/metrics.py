@@ -1,29 +1,33 @@
 import os
 
 from dagster import asset
-from dagster_duckdb import DuckDBResource
+import pandas as pd
+from sqlalchemy import text
 
 from . import constants
+from ..resources import PostgresResource
 
 
 
 @asset(
     deps=["add_movie_revenues"]
 )
-def create_movies_cleaned(database: DuckDBResource) -> None:
+def create_movies_cleaned(database: PostgresResource) -> None:
     """Build a cleaned movies table and expand genre IDs into rows."""
     query = """
-    CREATE OR REPLACE TABLE movies_cleaned AS
+    DROP TABLE IF EXISTS movies_cleaned;
+    CREATE TABLE movies_cleaned AS
     SELECT
         id,
         title,
-        CAST(strftime('%Y', CAST(release_date AS DATE)) AS INTEGER) AS release_year,
+        EXTRACT(YEAR FROM release_date)::INTEGER AS release_year,
         popularity,
         revenue,
         vote_average,
         vote_count,
-        UNNEST(genre_ids) AS genre_id
+        genre_id
     FROM movie
+    CROSS JOIN LATERAL unnest(genre_ids) AS genre_id
     WHERE release_date IS NOT NULL
       AND revenue IS NOT NULL
       AND revenue > 0
@@ -31,16 +35,17 @@ def create_movies_cleaned(database: DuckDBResource) -> None:
     """
 
     with database.get_connection() as conn:
-        conn.execute(query)
+        conn.execute(text(query))
 
 
 @asset(
     deps=["create_movies_cleaned", "get_genres_from_api"]
 )
-def transform_movies_for_analysis(database: DuckDBResource) -> None:
+def transform_movies_for_analysis(database: PostgresResource) -> None:
     """Create a denormalized analysis table combining movies and genres."""
     query = """
-    CREATE OR REPLACE TABLE movies_analysis AS
+    DROP TABLE IF EXISTS movies_analysis;
+    CREATE TABLE movies_analysis AS
     SELECT
         m.id,
         m.title,
@@ -57,17 +62,18 @@ def transform_movies_for_analysis(database: DuckDBResource) -> None:
     """
 
     with database.get_connection() as conn:
-        conn.execute(query)
+        conn.execute(text(query))
     
 
 @asset(
     deps=["transform_movies_for_analysis"]
 )
-def create_genre_year_statistics(database: DuckDBResource) -> None:
+def create_genre_year_statistics(database: PostgresResource) -> None:
     """Aggregate genre/year metrics and export the result as CSV."""
 
     query = """
-    CREATE OR REPLACE TABLE genre_year_statistics AS
+    DROP TABLE IF EXISTS genre_year_statistics;
+    CREATE TABLE genre_year_statistics AS
     SELECT
         genre_name,
         release_year,
@@ -81,13 +87,14 @@ def create_genre_year_statistics(database: DuckDBResource) -> None:
     """
 
     with database.get_connection() as conn:
-        conn.execute(query)
-        genre_year_statistics = conn.execute(
-            """
+        conn.execute(text(query))
+        genre_year_statistics = pd.read_sql(
+            text("""
             SELECT *
             FROM genre_year_statistics;
-            """
-        ).fetch_df()
+            """),
+            conn,
+        )
 
     os.makedirs(os.path.dirname(constants.GENRE_YEAR_STATISTICS), exist_ok=True)
     genre_year_statistics.to_csv(constants.GENRE_YEAR_STATISTICS, index=False, encoding="utf-8")
