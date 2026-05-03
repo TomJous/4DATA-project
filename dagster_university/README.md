@@ -1,36 +1,76 @@
-# dagster_university
+# Analyse de l'influence de la popularité sur les revenus des films
 
-This is a [Dagster](https://dagster.io/) project made to accompany Dagster University coursework.
+## Présentation du projet
 
-## Getting started
+> **Comment l'indice de popularité influence-t-il le revenu des films en fonction du genre cinématographique sur les 8 dernières années ?**
 
-First, install your Dagster code location as a Python package by running the command below in your terminal. By using the --editable (`-e`) flag, pip will install your Python package in ["editable mode"](https://pip.pypa.io/en/latest/topics/local-project-installs/#editable-installs) so that as you develop, local code changes will automatically apply.
+Ce projet est un pipeline de données complet, de la collecte brute jusqu'à la visualisation, construit autour de l'API [TheMovieDB (TMDB)](https://developer.themoviedb.org) et orchestré avec [Dagster](https://dagster.io/).
+
+### Stack technique
+
+| Composant | Technologie |
+|---|---|
+| Orchestration | Dagster |
+| Base de données | PostgreSQL |
+| Visualisation | Streamlit |
+| Source de données | API TheMovieDB |
+| Conteneurisation | Docker / Docker Compose |
+
+---
+
+## Pipeline de données
+
+### Assets
+
+Le pipeline est découpé en assets exécutés dans cet ordre :
+
+| Asset | Rôle |
+|---|---|
+| `get_movie_file_from_api` | Télécharge les films du mois depuis l'API TMDB et les sauvegarde en JSON |
+| `get_genres_from_api` | Récupère la liste des genres cinématographiques et les insère en base |
+| `load_movie_into_db` | Charge le fichier JSON de la partition mensuelle dans PostgreSQL |
+| `add_movie_revenues` | Enrichit chaque film avec son revenu via l'endpoint TMDB dédié |
+| `create_movies_cleaned` | Filtre les films sans revenu ni date, dénormalise les genres |
+| `transform_movies_for_analysis` | Joint avec les genres, filtre sur les 8 dernières années |
+| `create_genre_year_statistics` | Calcule les statistiques par genre/année et exporte un CSV |
+
+### Jobs et schedules
+
+| Nom | Déclenchement | Périmètre |
+|---|---|---|
+| `movie_monthly_job` | Manuel ou automatique | Tous les assets, partitionné par mois |
+| Schedule mensuel | 1er de chaque mois | Exécute `movie_monthly_job` sur la partition du mois courant |
+
+### Partitions
+
+Les assets liés à la collecte et au chargement sont **partitionnés par mois** (de janvier 2017 à aujourd'hui). Cela permet de relancer uniquement une période précise sans retraiter toute l'histoire.
+
+---
+
+## Lancer le projet
+
+### Prérequis
+
+- Docker et Docker Compose installés
+- Une clé API TheMovieDB (gratuite sur [themoviedb.org](https://developer.themoviedb.org))
+
+### Démarrage
+
+```bash
+cp .env.example .env   # remplir API_TOKEN et POSTGRES_PASSWORD
+docker compose up --build
+```
+
+- Interface Dagster : http://localhost:3000
+- Tableau de bord Streamlit : http://localhost:8501
+
+### Lancer les tests en local
+
+Les tests ne nécessitent pas Docker ni de clé API. Il faut installer les dépendances une seule fois :
 
 ```bash
 pip install -e ".[dev]"
 ```
-
-Duplicate the `.env.example` file and rename it to `.env`.
-
-Then, start the Dagster UI web server:
-
-```bash
-dagster dev
-```
-
-Open http://localhost:3000 with your browser to see the project.
-
-## Development
-
-### Adding new Python dependencies
-
-You can specify new Python dependencies in `setup.py`.
-
-## Deploy on Dagster Cloud
-
-The easiest way to deploy your Dagster project is to use Dagster Cloud.
-
-Check out the [Dagster Cloud Documentation](https://docs.dagster.cloud) to learn more.
 
 ---
 

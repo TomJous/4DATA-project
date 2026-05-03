@@ -308,8 +308,7 @@ def add_movie_revenues(context: AssetExecutionContext, database: PostgresResourc
         with database.get_connection() as conn:
             conn.execute(
                 text("""
-                UPDATE movie AS m
-                SET revenue = updates.revenue
+                UPDATE movie AS m SET revenue = updates.revenue
                 FROM (
                     SELECT
                         unnest(CAST(:movie_ids AS INTEGER[])) AS movie_id,

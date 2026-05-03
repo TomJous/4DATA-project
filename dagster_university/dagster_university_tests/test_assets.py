@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import requests as requests_lib
+
 import pandas as pd
 
 import pytest
@@ -176,7 +178,7 @@ def test_add_movie_revenues_calls_update(mock_postgres):
         add_movie_revenues(context, resource)
 
     executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
-    assert any("UPDATE movie SET revenue" in q for q in executed_queries)
+    assert any("UPDATE movie AS m SET revenue" in q for q in executed_queries)
 
 
 def test_add_movie_revenues_skips_on_error(mock_postgres):
@@ -186,6 +188,7 @@ def test_add_movie_revenues_skips_on_error(mock_postgres):
 
     mock_resp = MagicMock()
     mock_resp.status_code = 404
+    mock_resp.raise_for_status.side_effect = requests_lib.HTTPError(response=mock_resp)
 
     with patch("dagster_university.assets.movies.requests.Session") as mock_session_cls:
         mock_session = MagicMock()
@@ -198,7 +201,7 @@ def test_add_movie_revenues_skips_on_error(mock_postgres):
         add_movie_revenues(context, resource)
 
     executed_queries = [str(c.args[0]) for c in mock_conn.execute.call_args_list]
-    assert not any("UPDATE movie SET revenue" in q for q in executed_queries)
+    assert not any("UPDATE movie AS m SET revenue" in q for q in executed_queries)
 
 
 # ---------------------------------------------------------------------------
@@ -432,4 +435,5 @@ def test_add_movie_revenues_sleeps_on_rate_limit(mock_postgres):
             context = build_asset_context(partition_key=PARTITION_KEY)
             add_movie_revenues(context, resource)
 
-    mock_sleep.assert_called_once_with(1)
+    assert mock_sleep.call_count == 2
+    mock_sleep.assert_called_with(1)
