@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import calendar
@@ -19,6 +20,32 @@ load_dotenv()
 api_token = os.getenv("API_TOKEN")
 if not api_token:
     raise RuntimeError("API_TOKEN is required for TMDB access. Set it in the environment or .env file.")
+
+TMDB_MAX_WORKERS = int(os.getenv("TMDB_MAX_WORKERS", "8"))
+TMDB_REQUEST_TIMEOUT = int(os.getenv("TMDB_REQUEST_TIMEOUT", "10"))
+TMDB_MAX_RETRIES = int(os.getenv("TMDB_MAX_RETRIES", "3"))
+
+
+def _fetch_movie_revenue(movie_id: int, headers: dict[str, str]) -> tuple[int, int | None]:
+    """Fetch one movie revenue with lightweight retry handling for TMDB rate limits."""
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+
+    with requests.Session() as session:
+        for attempt in range(TMDB_MAX_RETRIES):
+            response = session.get(url, headers=headers, timeout=TMDB_REQUEST_TIMEOUT)
+
+            if response.status_code == 200:
+                return movie_id, response.json().get("revenue")
+
+            if response.status_code == 429 and attempt < TMDB_MAX_RETRIES - 1:
+                retry_after = response.headers.get("Retry-After", "1")
+                retry_after = int(retry_after) if retry_after.isdigit() else 1
+                time.sleep(retry_after)
+                continue
+
+            response.raise_for_status()
+
+    return movie_id, None
 
 @asset(
     partitions_def=monthly_partition
@@ -220,41 +247,87 @@ def load_movie_into_db(context: AssetExecutionContext, database: PostgresResourc
 )
 def add_movie_revenues(context: AssetExecutionContext, database: PostgresResource) -> None:
     """Enrich movie rows with revenue values from the TMDB movie details endpoint."""
-    with requests.Session() as session:
-        headers = {"accept": "application/json", "Authorization": f"Bearer {api_token}"}
+    partition_date = context.partition_key
+    headers = {"accept": "application/json", "Authorization": f"Bearer {api_token}"}
 
-        with database.get_connection() as conn:
-            conn.execute(text("ALTER TABLE movie ADD COLUMN IF NOT EXISTS revenue BIGINT;"))
-            movie_rows = conn.execute(
+    with database.get_connection() as conn:
+        conn.execute(text("ALTER TABLE movie ADD COLUMN IF NOT EXISTS revenue BIGINT;"))
+        movie_ids = [
+            row[0]
+            for row in conn.execute(
                 text("""
-                SELECT id
+                SELECT DISTINCT id
                 FROM movie
                 WHERE revenue IS NULL
-                """)
+                  AND partition_month = :partition_month
+                """),
+                {"partition_month": partition_date},
             ).fetchall()
+        ]
 
-            for (movie_id,) in movie_rows:
-                url = f"https://api.themoviedb.org/3/movie/{movie_id}"
-                response = session.get(url, headers=headers)
+    if not movie_ids:
+        context.log.info("No missing revenues for partition %s.", partition_date)
+        return
 
-                if response.status_code == 200:
-                    revenue = response.json().get("revenue")
-                    conn.execute(
-                        text("UPDATE movie SET revenue = :revenue WHERE id = :movie_id;"),
-                        {"revenue": revenue, "movie_id": movie_id},
-                    )
-                elif response.status_code == 429:
-                    context.log.warning(
-                        "TMDB rate limit reached for movie %s, retrying after sleep.",
-                        movie_id,
-                    )
-                    time.sleep(1)
-                else:
-                    context.log.warning(
-                        "Failed to fetch revenue for movie %s: %s",
-                        movie_id,
-                        response.status_code,
-                    )
-                    time.sleep(1)
+    context.log.info(
+        "Fetching revenues for %d movies in partition %s.",
+        len(movie_ids),
+        partition_date,
+    )
 
-    context.log.info("Revenues added successfully.")
+    revenue_rows = []
+    with ThreadPoolExecutor(max_workers=TMDB_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_movie_revenue, movie_id, headers): movie_id
+            for movie_id in movie_ids
+        }
+
+        for future in as_completed(futures):
+            movie_id = futures[future]
+            try:
+                fetched_movie_id, revenue = future.result()
+            except requests.HTTPError as error:
+                status_code = error.response.status_code if error.response is not None else "unknown"
+                context.log.warning(
+                    "Failed to fetch revenue for movie %s: %s",
+                    movie_id,
+                    status_code,
+                )
+                continue
+            except requests.RequestException as error:
+                context.log.warning(
+                    "Failed to fetch revenue for movie %s: %s",
+                    movie_id,
+                    error,
+                )
+                continue
+
+            revenue_rows.append({"movie_id": fetched_movie_id, "revenue": revenue})
+
+    if revenue_rows:
+        with database.get_connection() as conn:
+            conn.execute(
+                text("""
+                UPDATE movie AS m
+                SET revenue = updates.revenue
+                FROM (
+                    SELECT
+                        unnest(CAST(:movie_ids AS INTEGER[])) AS movie_id,
+                        unnest(CAST(:revenues AS BIGINT[])) AS revenue
+                ) AS updates
+                WHERE m.id = updates.movie_id
+                  AND m.partition_month = :partition_month;
+                """),
+                {
+                    "movie_ids": [row["movie_id"] for row in revenue_rows],
+                    "revenues": [row["revenue"] for row in revenue_rows],
+                    "partition_month": partition_date,
+                },
+            )
+
+    context.log.info(
+        "Revenues added for %d/%d movies in partition %s.",
+        len(revenue_rows),
+        len(movie_ids),
+        partition_date,
+    )

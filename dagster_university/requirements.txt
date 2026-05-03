@@ -3,4 +3,6 @@ dagster-webserver
 pandas
 psycopg2-binary
 sqlalchemy
+streamlit
+plotly
 
