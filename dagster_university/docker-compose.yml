@@ -28,10 +28,17 @@ services:
         condition: service_healthy
     ports:
       - "3000:3000"
+    environment:
+      DAGSTER_HOME: /app/.dagster
     volumes:
       - ./data:/app/data
       - .:/app
-    
+      - ./.dagster:/app/.dagster
+    shm_size: 256mb
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
   streamlit:
     build: .
     container_name: movies_streamlit
