@@ -31,6 +31,25 @@ services:
     volumes:
       - ./data:/app/data
       - .:/app
+    
+  streamlit:
+    build: .
+    container_name: movies_streamlit
+    command: streamlit run strimlit/streamlit_app.py --server.address=0.0.0.0 --server.port=8501
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    depends_on:
+      - postgres
+      - dagster
+    restart: always
 
 volumes:
   postgres_data:

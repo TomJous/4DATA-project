@@ -63,7 +63,48 @@ def transform_movies_for_analysis(database: PostgresResource) -> None:
 
     with database.get_connection() as conn:
         conn.execute(text(query))
-    
+
+
+@asset(
+    deps=["transform_movies_for_analysis"]
+)
+def create_movie_title_analysis(database: PostgresResource) -> None:
+    """Create one analysis row per movie/title and export it as CSV."""
+
+    query = """
+    DROP TABLE IF EXISTS movie_title_analysis;
+    CREATE TABLE movie_title_analysis AS
+    SELECT
+        id,
+        title,
+        release_year,
+        STRING_AGG(DISTINCT genre_name, ', ' ORDER BY genre_name) AS genres,
+        MAX(popularity) AS popularity,
+        MAX(revenue) AS revenue,
+        MAX(vote_average) AS vote_average,
+        MAX(vote_count) AS vote_count,
+        CASE
+            WHEN MAX(popularity) > 0 THEN MAX(revenue) / MAX(popularity)
+            ELSE NULL
+        END AS revenue_per_popularity_point
+    FROM movies_analysis
+    GROUP BY id, title, release_year
+    ORDER BY revenue DESC, popularity DESC, title;
+    """
+
+    with database.get_connection() as conn:
+        conn.execute(text(query))
+        movie_title_analysis = pd.read_sql(
+            text("""
+            SELECT *
+            FROM movie_title_analysis;
+            """),
+            conn,
+        )
+
+    os.makedirs(os.path.dirname(constants.MOVIE_TITLE_ANALYSIS), exist_ok=True)
+    movie_title_analysis.to_csv(constants.MOVIE_TITLE_ANALYSIS, index=False, encoding="utf-8")
+
 
 @asset(
     deps=["transform_movies_for_analysis"]

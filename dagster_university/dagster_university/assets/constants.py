@@ -5,6 +5,7 @@ MOVIES_TEMPLATE_FILE_PATH = "data/raw/movies_{}_{}.json"
 
 
 GENRE_YEAR_STATISTICS = "data/outputs/genre_year_statistics.csv"
+MOVIE_TITLE_ANALYSIS = "data/outputs/movie_title_analysis.csv"
 REQUEST_DESTINATION_TEMPLATE_FILE_PATH = "data/outputs/{}.png"
 
 DATE_FORMAT = "%Y-%m-%d"

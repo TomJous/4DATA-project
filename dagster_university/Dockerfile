@@ -8,5 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt &&\
     pip install --disable-pip-version-check --no-cache-dir -e .[dev]
 
 EXPOSE 3000
+EXPOSE 8501
 
 CMD ["dagster", "dev", "-h", "0.0.0.0"]
